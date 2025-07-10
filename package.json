@@ -1,0 +1,11 @@
+{
+  "name": "vercel-playwright-crawler",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "playwright": "^1.44.0"
+  }
+}
