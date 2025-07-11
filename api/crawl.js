@@ -1,38 +1,46 @@
 import { chromium } from 'playwright';
 
 export default async function handler(req, res) {
-  const { keyword = '화장품 일본' } = req.body;
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method Not Allowed' });
+  }
+
+  const { keyword } = req.body;
+  if (!keyword) {
+    return res.status(400).json({ error: 'Missing keyword in request body' });
+  }
+
   const searchUrl = `https://www.jobkorea.co.kr/Search/?stext=${encodeURIComponent(keyword)}`;
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+  });
+
   const page = await browser.newPage();
 
   try {
-    // User-Agent 우회
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114 Safari/537.36'
-    );
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('[data-sentry-component="CardCommon"]', { timeout: 10000 });
 
-    await page.goto(searchUrl, { timeout: 60000 });
-    await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(3000); // lazy load 기다림
+    const results = await page.$$eval('[data-sentry-component="CardCommon"]', (cards) => {
+      return cards.slice(0, 5).map((card) => {
+        const titleElement = card.querySelector('span[class*="Typography_variant_size18"]');
+        const title = titleElement?.innerText.trim();
 
-    const jobList = await page.$$eval('a[href^="/Recruit/GI_Read"]', (links) =>
-      links.slice(0, 10).map((a) => ({
-        title: a.innerText.trim(),
-        link: 'https://www.jobkorea.co.kr' + a.getAttribute('href'),
-      }))
-    );
+        const linkElement = card.querySelector('a[href*="Recruit/GI_Read"]');
+        const link = linkElement?.href;
 
-    await browser.close();
+        const company = card.querySelector('a[class*="company"]')?.innerText.trim() || null;
 
-    return res.status(200).json({
-      keyword,
-      count: jobList.length,
-      results: jobList,
+        return { title, link, company };
+      });
     });
+
+    res.status(200).json({ keyword, count: results.length, results });
   } catch (err) {
+    res.status(500).json({ error: 'Failed to crawl', details: err.message });
+  } finally {
     await browser.close();
-    return res.status(500).json({ error: err.message });
   }
 }
