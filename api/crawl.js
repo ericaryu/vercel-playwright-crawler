@@ -1,34 +1,39 @@
 import { chromium } from 'playwright';
 
 export default async function handler(req, res) {
-  const { jobUrl } = req.body;
+  const { keyword = '화장품 일본' } = req.body;
 
-  if (!jobUrl) {
-    return res.status(400).json({ error: 'Missing jobUrl' });
-  }
+  const searchUrl = `https://www.jobkorea.co.kr/Search/?stext=${encodeURIComponent(keyword)}`;
 
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
 
   try {
-    await page.goto(jobUrl, { timeout: 30000 });
+    // 잡코리아는 봇 차단이 있어 User-Agent 우회 추천
+    await page.setUserAgent(
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36'
+    );
 
-    const company = await page.locator('h6[class*=JobHeader_className__company]').textContent();
-    const jobTitle = await page.locator('h2[class*=JobHeader_className__jobPosition]').textContent();
+    await page.goto(searchUrl, { timeout: 60000 });
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(2000); // lazy load 대기
 
-    const responsibilities = await page.locator('div[data-testid="JobDescription"] >> text=주요업무')
-      .locator('xpath=following-sibling::div[1]').textContent();
-
-    const qualifications = await page.locator('div[data-testid="JobDescription"] >> text=자격요건')
-      .locator('xpath=following-sibling::div[1]').textContent();
+    // 공고 목록 파싱
+    const jobList = await page.$$eval('.list-default > li', (items) =>
+      items.slice(0, 5).map((el) => {
+        const title = el.querySelector('.title a')?.textContent?.trim() || '';
+        const company = el.querySelector('.name')?.textContent?.trim() || '';
+        const link = el.querySelector('.title a')?.href || '';
+        return { title, company, link };
+      })
+    );
 
     await browser.close();
 
     return res.status(200).json({
-      company: company?.trim(),
-      title: jobTitle?.trim(),
-      responsibilities: responsibilities?.trim(),
-      qualifications: qualifications?.trim()
+      keyword,
+      count: jobList.length,
+      results: jobList
     });
 
   } catch (error) {
