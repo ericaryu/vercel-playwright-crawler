@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vercel dev"
+    "dev": "vercel dev",
+    "postinstall": "playwright install chromium"
   },
   "dependencies": {
     "playwright": "^1.44.0"
