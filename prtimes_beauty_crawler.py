@@ -18,6 +18,7 @@ class PRTimesBeautyCrawler:
         headless: bool = True,
         batch_size: int = 5,
     ) -> None:
+        # Basic configuration and output naming.
         self.target_url = target_url
         self.base_url = "https://prtimes.jp"
         now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
@@ -26,12 +27,14 @@ class PRTimesBeautyCrawler:
         self.data_buffer: List[Dict[str, str]] = []
         self.scraped_count = 0
         self.headless = headless
+        # User-Agent to reduce basic bot detection.
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         )
 
+        # Output schema (Korean column names as requested).
         self.fieldnames = [
             "수집일시",
             "제목",
@@ -108,6 +111,7 @@ class PRTimesBeautyCrawler:
         self.data_buffer = []
 
     async def _click_load_more_until_old(self, page: Page) -> None:
+        # Click "more" while the last item is still "minutes/hours ago".
         while True:
             time_elements = await page.query_selector_all("time.time, time")
             if not time_elements:
@@ -151,6 +155,7 @@ class PRTimesBeautyCrawler:
                 await page.wait_for_timeout(1200)
 
     async def _collect_today_articles(self, page: Page) -> List[Dict[str, str]]:
+        # Collect only articles that show relative time (today).
         items = await page.query_selector_all(".list-press-release .item-main, .item-main")
         results: List[Dict[str, str]] = []
         seen_urls = set()
@@ -211,6 +216,7 @@ class PRTimesBeautyCrawler:
     async def _get_company_info(
         self, page: Page, detail_url: Optional[str]
     ) -> Tuple[Dict[str, str], str]:
+        # Visit company page and extract profile table + intro + SNS.
         info = self._default_company_info()
         intro_text = self._null_value()
 
@@ -293,6 +299,7 @@ class PRTimesBeautyCrawler:
         return info, intro_text
 
     async def run(self) -> None:
+        # Main workflow: open listing, expand, collect, then crawl company pages.
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=self.headless,
