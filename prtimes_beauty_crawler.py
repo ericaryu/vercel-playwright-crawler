@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import csv
-import datetime
 import os
 import random
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from urllib.parse import urljoin
 
+import ollama
 from playwright.async_api import async_playwright, Page
 
 
@@ -17,16 +17,18 @@ class PRTimesBeautyCrawler:
         target_url: str,
         headless: bool = True,
         batch_size: int = 5,
+        output_file: str = "prtimes_beauty_today.csv",
+        ollama_model: str = "llama3",
     ) -> None:
         # Basic configuration and output naming.
         self.target_url = target_url
         self.base_url = "https://prtimes.jp"
-        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        self.output_file = f"prtimes_beauty_{now_str}.csv"
+        self.output_file = output_file
         self.batch_size = batch_size
         self.data_buffer: List[Dict[str, str]] = []
         self.scraped_count = 0
         self.headless = headless
+        self.ollama_model = ollama_model
         # User-Agent to reduce basic bot detection.
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -34,30 +36,52 @@ class PRTimesBeautyCrawler:
             "Chrome/120.0.0.0 Safari/537.36"
         )
 
-        # Output schema (Korean column names as requested).
+        # Output schema based on requested fields.
         self.fieldnames = [
-            "수집일시",
-            "제목",
-            "회사명",
-            "회사소개",
-            "산업",
-            "본사 소재지",
-            "전화번호",
-            "대표자 이름",
-            "상장",
-            "자본금",
-            "설립",
-            "URL",
-            "X",
-            "Facebook",
-            "YouTube",
-            "Instagram",
-            "LinkedIn",
+            "일어 기사 제목",
+            "한국어 번역",
+            "링크",
+            "게재 일시",
+            "관련 회사명(원문)",
+            "관련 회사명(한국어발음)",
+            "회사 링크",
+            "industry",
+            "address",
+            "phone",
+            "ceo",
+            "listing",
+            "capital",
+            "founded",
+            "official_url",
+            "sns_x",
+            "sns_fb",
+            "sns_yt",
+            "이메일",
+        ]
+
+        self.article_selector = (
+            "article.item, article.list-article__item, "
+            "li.list-article__item, .item-main, .item"
+        )
+        self.time_selectors = ["time.time", ".time", "time"]
+        self.title_selectors = ["h3.title a", "a.link-title", ".link-title a"]
+        self.company_selectors = [".company-name", "a.link-company", ".link-company"]
+        self.load_more_selectors = [
+            ".link-more",
+            ".btn-more",
+            "a:has-text('もっと見る')",
+            "button:has-text('もっと見る')",
         ]
 
     @staticmethod
     def _normalize_text(text: str) -> str:
         return re.sub(r"\s+", " ", text).strip()
+
+    def _clean_text(self, text: Optional[str]) -> str:
+        if not text:
+            return self._null_value()
+        cleaned = self._normalize_text(text)
+        return cleaned if cleaned else self._null_value()
 
     @staticmethod
     def _is_today_relative_time(text: str) -> bool:
@@ -68,23 +92,21 @@ class PRTimesBeautyCrawler:
 
     @staticmethod
     def _null_value() -> str:
-        return "Null"
+        return "NULL"
 
     def _default_company_info(self) -> Dict[str, str]:
         return {
-            "산업": self._null_value(),
-            "본사 소재지": self._null_value(),
-            "전화번호": self._null_value(),
-            "대표자 이름": self._null_value(),
-            "상장": self._null_value(),
-            "자본금": self._null_value(),
-            "설립": self._null_value(),
-            "URL": self._null_value(),
-            "X": self._null_value(),
-            "Facebook": self._null_value(),
-            "YouTube": self._null_value(),
-            "Instagram": self._null_value(),
-            "LinkedIn": self._null_value(),
+            "industry": self._null_value(),
+            "address": self._null_value(),
+            "phone": self._null_value(),
+            "ceo": self._null_value(),
+            "listing": self._null_value(),
+            "capital": self._null_value(),
+            "founded": self._null_value(),
+            "official_url": self._null_value(),
+            "sns_x": self._null_value(),
+            "sns_fb": self._null_value(),
+            "sns_yt": self._null_value(),
         }
 
     def _random_wait(self, start: float = 1.2, end: float = 2.8) -> float:
@@ -92,6 +114,54 @@ class PRTimesBeautyCrawler:
 
     async def _sleep_random(self, start: float = 1.2, end: float = 2.8) -> None:
         await asyncio.sleep(self._random_wait(start, end))
+
+    async def _find_first(self, root, selectors: List[str]):
+        for selector in selectors:
+            element = await root.query_selector(selector)
+            if element:
+                return element
+        return None
+
+    async def _extract_time_text(self, item) -> str:
+        for selector in self.time_selectors:
+            element = await item.query_selector(selector)
+            if element:
+                text = await element.inner_text()
+                text = self._normalize_text(text) if text else ""
+                if text:
+                    return text
+        return ""
+
+    async def _ask_ollama(self, system_prompt: str, user_content: str) -> str:
+        if not user_content or user_content == self._null_value():
+            return self._null_value()
+        try:
+            response = await asyncio.to_thread(
+                ollama.chat,
+                model=self.ollama_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            return self._clean_text(response["message"]["content"])
+        except Exception:
+            return self._null_value()
+
+    async def _extract_email(self, page: Page) -> str:
+        try:
+            body_text = await page.inner_text("body")
+        except Exception:
+            return self._null_value()
+
+        if not body_text:
+            return self._null_value()
+
+        match = re.search(
+            r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+            body_text,
+        )
+        return match.group(0) if match else self._null_value()
 
     def _append_to_csv(self) -> None:
         if not self.data_buffer:
@@ -113,28 +183,20 @@ class PRTimesBeautyCrawler:
     async def _click_load_more_until_old(self, page: Page) -> None:
         # Click "more" while the last item is still "minutes/hours ago".
         while True:
-            time_elements = await page.query_selector_all("time.time, time")
-            if not time_elements:
+            items = await page.query_selector_all(self.article_selector)
+            if not items:
                 break
 
-            last_time_text = self._null_value()
-            try:
-                last_time_text = await time_elements[-1].inner_text()
-            except Exception:
-                pass
+            last_time_text = await self._extract_time_text(items[-1])
 
             if not self._is_today_relative_time(last_time_text):
                 break
 
-            load_more_btn = await page.query_selector(
-                ".link-more, .btn-more, a:has-text('もっと見る'), button:has-text('もっと見る')"
-            )
+            load_more_btn = await self._find_first(page, self.load_more_selectors)
             if not load_more_btn:
                 break
 
-            prev_count = len(
-                await page.query_selector_all(".list-press-release .item-main, .item-main")
-            )
+            prev_count = len(items)
             wait_time = self._random_wait(1.5, 3.5)
             print(f"다음 페이지 로딩 중... ({wait_time:.2f}초 대기)")
             await asyncio.sleep(wait_time)
@@ -144,7 +206,7 @@ class PRTimesBeautyCrawler:
                 await page.wait_for_function(
                     """(prev) => {
                         const items = document.querySelectorAll(
-                          '.list-press-release .item-main, .item-main'
+                          'article.item, article.list-article__item, li.list-article__item, .item-main, .item'
                         );
                         return items.length > prev;
                     }""",
@@ -156,150 +218,130 @@ class PRTimesBeautyCrawler:
 
     async def _collect_today_articles(self, page: Page) -> List[Dict[str, str]]:
         # Collect only articles that show relative time (today).
-        items = await page.query_selector_all(".list-press-release .item-main, .item-main")
+        items = await page.query_selector_all(self.article_selector)
         results: List[Dict[str, str]] = []
         seen_urls = set()
 
         for item in items:
-            time_tag = await item.query_selector("time.time, time")
-            time_text = ""
-            if time_tag:
-                try:
-                    time_text = await time_tag.inner_text()
-                except Exception:
-                    time_text = ""
+            time_text = await self._extract_time_text(item)
 
             if not self._is_today_relative_time(time_text):
                 continue
 
-            title_elem = await item.query_selector("a.link-title, .link-title")
-            company_elem = await item.query_selector("a.link-company, .link-company")
+            title_elem = await self._find_first(item, self.title_selectors)
+            company_elem = await self._find_first(item, self.company_selectors)
 
-            if not title_elem or not company_elem:
+            if not title_elem:
                 continue
 
             title = self._null_value()
             company_name = self._null_value()
+            title_href = None
             company_href = None
 
             try:
-                title = self._normalize_text(await title_elem.inner_text())
+                title = self._clean_text(await title_elem.inner_text())
             except Exception:
                 pass
-
-            try:
-                company_name = self._normalize_text(await company_elem.inner_text())
-            except Exception:
-                pass
-
-            try:
-                company_href = await company_elem.get_attribute("href")
-            except Exception:
-                company_href = None
-
-            company_url = urljoin(self.base_url, company_href) if company_href else None
-            if company_url and company_url in seen_urls:
+            if title == self._null_value():
                 continue
-            if company_url:
-                seen_urls.add(company_url)
+
+            if company_elem:
+                try:
+                    company_name = self._clean_text(await company_elem.inner_text())
+                except Exception:
+                    pass
+
+            try:
+                title_href = await title_elem.get_attribute("href")
+            except Exception:
+                title_href = None
+
+            if company_elem:
+                try:
+                    company_href = await company_elem.get_attribute("href")
+                except Exception:
+                    company_href = None
+
+            article_url = urljoin(self.base_url, title_href) if title_href else None
+            company_url = (
+                urljoin(self.base_url, company_href)
+                if company_href
+                else self._null_value()
+            )
+            if not article_url:
+                continue
+            if article_url and article_url in seen_urls:
+                continue
+            if article_url:
+                seen_urls.add(article_url)
 
             results.append(
                 {
-                    "title": title,
-                    "company_name": company_name,
-                    "company_url": company_url,
+                    "title_jp": title,
+                    "link": article_url,
+                    "time": time_text,
+                    "comp_jp": company_name,
+                    "comp_link": company_url,
                 }
             )
 
         return results
 
-    async def _get_company_info(
-        self, page: Page, detail_url: Optional[str]
-    ) -> Tuple[Dict[str, str], str]:
-        # Visit company page and extract profile table + intro + SNS.
-        info = self._default_company_info()
-        intro_text = self._null_value()
+    async def _extract_company_data(self, page: Page) -> Dict[str, str]:
+        # Extract company info from press release detail page (dl > dt/dd structure).
+        data = self._default_company_info()
+        dl_elements = await page.query_selector_all("dl.__dl_93dhx_1")
+        if not dl_elements:
+            dl_elements = await page.query_selector_all("dl")
 
-        if not detail_url:
-            return info, intro_text
+        for dl in dl_elements:
+            dts = await dl.query_selector_all("dt")
+            dds = await dl.query_selector_all("dd")
 
-        try:
-            await page.goto(detail_url, wait_until="domcontentloaded")
-            await self._sleep_random(1.0, 2.0)
-
-            intro_selectors = [
-                ".company-description-text",
-                ".company-description",
-                ".company-profile__description",
-                ".company-profile__text",
-                ".company-about",
-            ]
-            for selector in intro_selectors:
-                node = await page.query_selector(selector)
-                if node:
-                    text = await node.inner_text()
-                    if text and text.strip():
-                        intro_text = self._normalize_text(text)
-                        break
-
-            rows = await page.query_selector_all(
-                "tr.table-row, table.company-profile-table tr, .company-info-table tr"
-            )
-            for row in rows:
-                th = await row.query_selector("th")
-                td = await row.query_selector("td")
-                if not th or not td:
+            for dt, dd in zip(dts, dds):
+                key = self._clean_text(await dt.inner_text())
+                if key == self._null_value():
                     continue
 
-                label = self._normalize_text(await th.inner_text())
-                value = self._normalize_text(await td.inner_text())
-                if not value:
-                    value = self._null_value()
+                link_el = await dd.query_selector("a")
+                if link_el:
+                    val = await link_el.get_attribute("href")
+                    if val and val.startswith("/"):
+                        val = urljoin(self.base_url, val)
+                else:
+                    val = await dd.inner_text()
+                val = self._clean_text(val.replace("\n", " ") if val else val)
 
-                if "業種" in label or "産業" in label:
-                    info["산업"] = value
-                elif "本社所在地" in label or "所在地" in label:
-                    info["본사 소재지"] = value
-                elif "電話番号" in label or "TEL" in label:
-                    info["전화번호"] = value
-                elif "代表" in label:
-                    info["대표자 이름"] = value
-                elif "上場" in label:
-                    info["상장"] = value
-                elif "資本金" in label:
-                    info["자본금"] = value
-                elif "設立" in label or "創立" in label:
-                    info["설립"] = value
-                elif "URL" in label or "Web" in label or "ウェブ" in label:
-                    info["URL"] = value
+                key_compact = key.strip()
 
-            sns_links = await page.query_selector_all(
-                "a[href*='twitter.com'], a[href*='x.com'], "
-                "a[href*='facebook.com'], a[href*='youtube.com'], "
-                "a[href*='instagram.com'], a[href*='linkedin.com']"
-            )
-            for link in sns_links:
-                href = await link.get_attribute("href")
-                if not href:
-                    continue
-                if "twitter.com" in href or "x.com" in href:
-                    info["X"] = href
-                elif "facebook.com" in href:
-                    info["Facebook"] = href
-                elif "youtube.com" in href:
-                    info["YouTube"] = href
-                elif "instagram.com" in href:
-                    info["Instagram"] = href
-                elif "linkedin.com" in href:
-                    info["LinkedIn"] = href
+                if "業種" in key_compact:
+                    data["industry"] = val
+                elif "本社所在地" in key_compact:
+                    data["address"] = val
+                elif "電話番号" in key_compact:
+                    data["phone"] = val
+                elif "代表者名" in key_compact or "代表者" in key_compact:
+                    data["ceo"] = val
+                elif "上場" in key_compact:
+                    data["listing"] = val
+                elif "資本金" in key_compact:
+                    data["capital"] = val
+                elif "設立" in key_compact or "創立" in key_compact:
+                    data["founded"] = val
+                elif "URL" in key_compact:
+                    data["official_url"] = val
+                elif key_compact.startswith("X"):
+                    data["sns_x"] = val
+                elif "Facebook" in key_compact:
+                    data["sns_fb"] = val
+                elif "YouTube" in key_compact:
+                    data["sns_yt"] = val
 
-        except Exception as exc:
-            print(f"상세 페이지 오류 ({detail_url}): {exc}")
-
-        return info, intro_text
+        return data
 
     async def run(self) -> None:
-        # Main workflow: open listing, expand, collect, then crawl company pages.
+        # Main workflow: open listing, expand, collect, then crawl detail pages.
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=self.headless,
@@ -325,19 +367,38 @@ class PRTimesBeautyCrawler:
                 self.scraped_count = idx
                 print(
                     f"현재 {self.scraped_count}번째 데이터 수집 중... "
-                    f"({item.get('company_name', self._null_value())})"
+                    f"({item.get('comp_jp', self._null_value())})"
                 )
 
-                info, intro_text = await self._get_company_info(
-                    page, item.get("company_url")
+                article_link = item.get("link") or self._null_value()
+                if article_link != self._null_value():
+                    await page.goto(article_link, wait_until="domcontentloaded")
+                    await self._sleep_random(1.0, 2.0)
+                    company_info = await self._extract_company_data(page)
+                    email = await self._extract_email(page)
+                else:
+                    company_info = self._default_company_info()
+                    email = self._null_value()
+
+                title_ko = await self._ask_ollama(
+                    "Translate Japanese beauty news title to Korean. Only output result.",
+                    item.get("title_jp", self._null_value()),
+                )
+                comp_ko = await self._ask_ollama(
+                    "Write the Japanese company name in Korean pronunciation. (e.g. 주식회사 XXX).",
+                    item.get("comp_jp", self._null_value()),
                 )
 
                 row = {
-                    "수집일시": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "제목": item.get("title", self._null_value()),
-                    "회사명": item.get("company_name", self._null_value()),
-                    "회사소개": intro_text,
-                    **info,
+                    "일어 기사 제목": item.get("title_jp", self._null_value()),
+                    "한국어 번역": title_ko,
+                    "링크": article_link,
+                    "게재 일시": item.get("time", self._null_value()),
+                    "관련 회사명(원문)": item.get("comp_jp", self._null_value()),
+                    "관련 회사명(한국어발음)": comp_ko,
+                    "회사 링크": item.get("comp_link", self._null_value()),
+                    **company_info,
+                    "이메일": email,
                 }
                 self.data_buffer.append(row)
 
